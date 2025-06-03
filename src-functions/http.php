@@ -4,22 +4,22 @@ use JsonException;
 
 function getHttpRequest(): array
 {
-    // 特定のヘッダーを取得
-    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
-    $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
-    $authorization = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-
-    // すべてのHTTPヘッダーを取得
-    $headers = [
-        'User-Agent' => $userAgent,
-        'Content-Type' => $contentType,
-        'Authorization' => $authorization,
-    ];
+    // すべてのHTTPヘッダーを取得（重複・不整合解消）
+    $headers = [];
     foreach ($_SERVER as $key => $value) {
         if (str_starts_with($key, 'HTTP_')) {
-            $header = str_replace(array('HTTP_', '_'), array('', '-'), $key);
+            $header = str_replace(['HTTP_', '_'], ['', '-'], $key);
             $header = ucwords(strtolower($header), '-');
             $headers[$header] = $value;
+        }
+    }
+    // HTTP_で始まらない主要ヘッダーも追加
+    foreach ([
+        'CONTENT_TYPE' => 'Content-Type',
+        'AUTHORIZATION' => 'Authorization',
+    ] as $serverKey => $headerName) {
+        if (isset($_SERVER[$serverKey])) {
+            $headers[$headerName] = $_SERVER[$serverKey];
         }
     }
 
@@ -40,15 +40,13 @@ function getHttpRequest(): array
 
 function writeHttpResponse(array $response, int $statusCode = 200): void
 {
-    // This function is a placeholder for the actual HTTP response logic.
-    // It should handle the response, such as sending it back to the client.
     header('Content-Type: application/json');
     http_response_code($statusCode);
     try {
         echo json_encode($response, JSON_THROW_ON_ERROR);
     } catch (JsonException $e) {
         http_response_code(500);
-        echo "{\"error\": \"Internal Server Error\"}";
+        echo json_encode(['error' => 'Internal Server Error']);
     }
 }
 
@@ -73,34 +71,39 @@ function bindQueryParams(array $definition, array $request): array
     if (isset($definition['query'])) {
         foreach ($definition['query'] as $paramName => $paramDefinition) {
             if (!isset($request['query'][$paramName])) {
-                if (isset($paramDefinition['required']) && $paramDefinition['required']) {
+                if (!empty($paramDefinition['required'])) {
                     return [true, [
                         'message' => "Missing required query parameter: $paramName",
                         'parameter' => $paramName,
-                    ], $request]; // Required parameter is missing
+                    ], $request];
                 }
-                // Set default value if available
                 $request['query'][$paramName] = $paramDefinition['default'] ?? null;
             }
 
-            $query = match($definition['query'][$paramName]['type'] ?? 'string') {
-                'int' => (int)$request['query'][$paramName],
-                'float' => (float)$request['query'][$paramName],
-                'bool' => filter_var($request['query'][$paramName], FILTER_VALIDATE_BOOLEAN),
-                'array' => explode(',', $request['query'][$paramName]),
-                default => (string)$request['query'][$paramName],
+            $value = $request['query'][$paramName];
+            $type = $paramDefinition['type'] ?? 'string';
+            $converted = match($type) {
+                'int' => filter_var($value, FILTER_VALIDATE_INT, FILTER_NULL_ON_FAILURE),
+                'float' => filter_var($value, FILTER_VALIDATE_FLOAT, FILTER_NULL_ON_FAILURE),
+                'bool' => filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE),
+                'array' => is_array($value) ? $value : explode(',', (string)$value),
+                default => (string)$value,
             };
-            $request['query'][$paramName] = $query;
+            if ($converted === null && $type !== 'string' && $value !== null) {
+                return [true, [
+                    'message' => "Invalid type for query parameter: $paramName",
+                    'parameter' => $paramName,
+                ], $request];
+            }
+            $request['query'][$paramName] = $converted;
         }
-        $request['query'] = $request['query'] ?? [];
     }
-    return [false, [], $request]; // Placeholder implementation
+    return [false, [], $request];
 }
 
 function bindBody(array $definition, array $request)
 {
     if ($request['method'] === 'POST' || $request['method'] === 'PUT') {
-        // Handle request body for POST/PUT methods
         $body = file_get_contents('php://input');
         if ($body !== false) {
             try {
@@ -113,6 +116,8 @@ function bindBody(array $definition, array $request)
             return [true, ['message' => 'Failed to read request body'], null];
         }
     }
+    // POST/PUT以外でも必ず3要素返す
+    return [false, [], null];
 }
 
 
@@ -130,19 +135,27 @@ function handleHttpRequest(array $definitions): void
         return;
     }
 
-    // クエリの検証
-    [$error, $message, $requestWithQuery] = bindQueryParams($definition, $request);
-    if ($error) {
-        writeHttpResponse($message, 400);
-        return;
+    // バリデーションの共通処理
+    $validators = [
+        function($def, $req) {
+            return bindQueryParams($def, $req);
+        },
+        function($def, $req) {
+            [$err, $msg, $body] = bindBody($def, $req);
+            $req['body'] = $body;
+            return [$err, $msg, $req];
+        },
+    ];
+
+    $currentRequest = $request;
+    foreach ($validators as $validator) {
+        [$error, $errorMessage, $currentRequest] = $validator($definition, $currentRequest);
+        if ($error) {
+            writeHttpResponse($errorMessage, 400);
+            return;
+        }
     }
-    // リクエストBodyの検証
-    [$bodyError, $message, $body] = bindBody($definition, $requestWithQuery);
-    if ($bodyError) {
-        writeHttpResponse($message, 400);
-        return;
-    }
-    $requestWithQuery['body'] = $body;
+    $requestWithQuery = $currentRequest;
 
     if (isset($definition['callback']) && is_callable($definition['callback'])) {
         [$statusCode, $response] = $definition['callback']($requestWithQuery);

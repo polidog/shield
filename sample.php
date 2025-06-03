@@ -10,10 +10,10 @@ use Polidog\Shield\Handler;
 new Handler()->handle([
     'GET /' => [
         'query' => [
-            'name' => [
-                'type' => 'string',
-                'required' => true,
-                'default' => '',
+            'page' => [
+                'type' => 'int',
+                'required' => false,
+                'default' => 1,
             ]
         ],
         'response' => [
@@ -42,7 +42,7 @@ new Handler()->handle([
             return [
                 200,
                 [
-                    'page' => 1,
+                    'page' => $request['query']['page'],
                     'items' => [
                         ['id' => 1, 'name' => 'Item 1', 'description' => 'Description 1'],
                         ['id' => 2, 'name' => 'Item 2', 'description' => 'Description 2'],
